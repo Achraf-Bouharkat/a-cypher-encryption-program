@@ -1,0 +1,204 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+/* -------------------- Utility -------------------- */
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage:\n"
+        "  %s -a {caesar|vigenere} -m {enc|dec} -k <key> [-i infile] [-o outfile]\n"
+        "\n"
+        "Examples:\n"
+        "  # Caesar shift by 3 (encrypt from stdin to stdout)\n"
+        "  echo \"Hello, World!\" | %s -a caesar -m enc -k 3\n"
+        "\n"
+        "  # Caesar decrypt file -> out.txt\n"
+        "  %s -a caesar -m dec -k -3 -i secret.txt -o out.txt\n"
+        "\n"
+        "  # Vigenere with key \"LEMON\"\n"
+        "  echo \"ATTACKATDAWN\" | %s -a vigenere -m enc -k LEMON\n"
+        "  echo \"LXFOPVEFRNHR\" | %s -a vigenere -m dec -k LEMON\n",
+        prog, prog, prog, prog, prog
+    );
+}
+
+static int is_alpha_str(const char *s) {
+    if (!s || !*s) return 0;
+    for (; *s; ++s) if (!isalpha((unsigned char)*s)) return 0;
+    return 1;
+}
+
+/* shift a single ASCII letter by 'shift' preserving case; others unchanged */
+static char shift_char_caesar(char c, int shift) {
+    if (c >= 'A' && c <= 'Z') {
+        int base = 'A';
+        int off = (c - base + (shift % 26) + 26) % 26;
+        return (char)(base + off);
+    } else if (c >= 'a' && c <= 'z') {
+        int base = 'a';
+        int off = (c - base + (shift % 26) + 26) % 26;
+        return (char)(base + off);
+    }
+    return c;
+}
+
+/* -------------------- Caesar -------------------- */
+
+static void caesar_process_stream(FILE *in, FILE *out, int shift) {
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        for (size_t i = 0; i < n; ++i) {
+            buf[i] = shift_char_caesar(buf[i], shift);
+        }
+        fwrite(buf, 1, n, out);
+    }
+}
+
+/* -------------------- Vigenere -------------------- */
+
+typedef struct {
+    int *shifts;     /* array of shifts 0..25 */
+    size_t len;      /* length of key (letters only) */
+} vkey_t;
+
+static vkey_t vkey_from_string(const char *key) {
+    vkey_t vk = {0};
+    if (!key) return vk;
+    size_t L = strlen(key);
+    /* count letters */
+    size_t letters = 0;
+    for (size_t i = 0; i < L; ++i) if (isalpha((unsigned char)key[i])) letters++;
+    if (letters == 0) return vk;
+
+    vk.shifts = (int*)malloc(sizeof(int) * letters);
+    if (!vk.shifts) { vk.len = 0; return vk; }
+
+    size_t j = 0;
+    for (size_t i = 0; i < L; ++i) {
+        unsigned char c = (unsigned char)key[i];
+        if (isalpha(c)) {
+            int up = toupper(c);
+            vk.shifts[j++] = up - 'A'; /* 0..25 */
+        }
+    }
+    vk.len = letters;
+    return vk;
+}
+
+static void vkey_free(vkey_t *vk) {
+    if (vk && vk->shifts) free(vk->shifts);
+    if (vk) { vk->shifts = NULL; vk->len = 0; }
+}
+
+static void vigenere_process_stream(FILE *in, FILE *out, const vkey_t *vk, int encrypt) {
+    if (!vk || vk->len == 0) return;
+    int c;
+    size_t ki = 0; /* index into key for letters only */
+    while ((c = fgetc(in)) != EOF) {
+        char ch = (char)c;
+        if (isalpha((unsigned char)ch)) {
+            int shift = vk->shifts[ki % vk->len];
+            if (!encrypt) shift = -shift;
+            ch = shift_char_caesar(ch, shift);
+            ki++;
+        }
+        fputc(ch, out);
+    }
+}
+
+/* -------------------- Main -------------------- */
+
+int main(int argc, char **argv) {
+    const char *algo = NULL;      /* "caesar" or "vigenere" */
+    const char *mode = NULL;      /* "enc" or "dec" */
+    const char *key  = NULL;      /* integer for caesar, alpha word for vigenere */
+    const char *infile = NULL;
+    const char *outfile = NULL;
+
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "-a") && i+1 < argc) { algo = argv[++i]; }
+        else if (!strcmp(argv[i], "-m") && i+1 < argc) { mode = argv[++i]; }
+        else if (!strcmp(argv[i], "-k") && i+1 < argc) { key = argv[++i]; }
+        else if (!strcmp(argv[i], "-i") && i+1 < argc) { infile = argv[++i]; }
+        else if (!strcmp(argv[i], "-o") && i+1 < argc) { outfile = argv[++i]; }
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            usage(argv[0]); return 0;
+        } else {
+            fprintf(stderr, "Unknown or incomplete option: %s\n", argv[i]);
+            usage(argv[0]); return 1;
+        }
+    }
+
+    if (!algo || !mode || !key) {
+        fprintf(stderr, "Missing required options.\n");
+        usage(argv[0]);
+        return 1;
+    }
+
+    int is_caesar = !strcmp(algo, "caesar");
+    int is_vigenere = !strcmp(algo, "vigenere");
+    if (!is_caesar && !is_vigenere) {
+        fprintf(stderr, "Invalid -a value: %s\n", algo);
+        return 1;
+    }
+
+    int encrypt;
+    if (!strcmp(mode, "enc")) encrypt = 1;
+    else if (!strcmp(mode, "dec")) encrypt = 0;
+    else {
+        fprintf(stderr, "Invalid -m value: %s (use enc|dec)\n", mode);
+        return 1;
+    }
+
+    FILE *in = stdin, *out = stdout;
+    if (infile) {
+        in = fopen(infile, "rb");
+        if (!in) { perror("Opening input"); return 1; }
+    }
+    if (outfile) {
+        out = fopen(outfile, "wb");
+        if (!out) {
+            perror("Opening output");
+            if (in && in != stdin) fclose(in);
+            return 1;
+        }
+    }
+
+    int rc = 0;
+
+    if (is_caesar) {
+        char *endptr = NULL;
+        long shift = strtol(key, &endptr, 10);
+        if (!endptr || *endptr != '\0') {
+            fprintf(stderr, "Caesar key (-k) must be an integer (e.g., 3 or -3).\n");
+            rc = 1;
+        } else {
+            int eff = (int)shift;
+            /* For decryption, invert shift (or user can pass negative) */
+            if (!encrypt) eff = -eff;
+            caesar_process_stream(in, out, eff);
+        }
+    } else if (is_vigenere) {
+        if (!is_alpha_str(key)) {
+            fprintf(stderr, "Vigenere key (-k) must contain letters only (A-Z or a-z).\n");
+            rc = 1;
+        } else {
+            vkey_t vk = vkey_from_string(key);
+            if (vk.len == 0) {
+                fprintf(stderr, "Failed to parse Vigenere key.\n");
+                rc = 1;
+            } else {
+                vigenere_process_stream(in, out, &vk, encrypt);
+                vkey_free(&vk);
+            }
+        }
+    }
+
+    if (in && in != stdin) fclose(in);
+    if (out && out != stdout) fclose(out);
+    return rc;
+}
+
